@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
@@ -47,6 +48,17 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Log struct {
+}
+
+type RaftState string
+
+const (
+	Follwer   RaftState = "Follower"
+	Candidate RaftState = "Candidate"
+	Leader    RaftState = "Leader"
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -59,6 +71,22 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	state        RaftState     // 当前节点的角色
+	heartbeat    time.Duration //心跳间隔
+	electionTime time.Time     // 当前节点过期时间
+
+	//Persistent state on all servers:
+	currentTerm int   //当前节点见过的最新任期
+	votedFor    int   //当前节点投票给谁了
+	log         []Log //当前节点的日志条目
+
+	//Volatile state on all servers:
+	commitIndex int // 当前节点日志中已经提交的最新索引
+	lastApplied int // 应用给状态机的日志中的最新索引
+
+	//Volatile state on leaders:
+	nextIndex  []int // 对于每个服务器 要接收的日志索引
+	matchIndex []int // 对于每个服务器 已知的被复制的日志的索引
 }
 
 // return currentTerm and whether this server
@@ -127,12 +155,18 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	term         int //候选者的任期
+	candidateId  int // 候选者的索引
+	lastLogIndex int // 候选者的最后一条日志的索引
+	lastLogTerm  int // 候选者的最后一条日志的任期
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	term        int //回应给候选者的当前节点的任期
+	voteGranted int // 是否投票
 }
 
 // example RequestVote RPC handler.
@@ -221,7 +255,12 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
+		time.Sleep(rf.heartbeat)
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if rf.state == Leader {
+			rf.AppendEntries()
+		}
 	}
 }
 
@@ -242,6 +281,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+
+	//2A
+	rf.Follower = Follower               // 节点初始角色
+	rf.commitIndex = 0                   //当前节点见过的最新任期 初始化为0
+	rf.votedFor = -1                     //当前节点投票给谁了 初始化为-1
+	rf.heartBeat = 50 * time.Millisecond // 心跳间隔
+	rf.resetElection()                   // 重置当前节点的过期时间
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
