@@ -48,13 +48,10 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type Log struct {
-}
-
 type RaftState string
 
 const (
-	Follwer   RaftState = "Follower"
+	Follower  RaftState = "Follower"
 	Candidate RaftState = "Candidate"
 	Leader    RaftState = "Leader"
 )
@@ -71,14 +68,13 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	state        RaftState     // 当前节点的角色
-	heartbeat    time.Duration //心跳间隔
-	electionTime time.Time     // 当前节点过期时间
+	state        RaftState // 当前节点的角色
+	electionTime time.Time // 当前节点过期时间
 
 	//Persistent state on all servers:
-	currentTerm int   //当前节点见过的最新任期
-	votedFor    int   //当前节点投票给谁了
-	log         []Log //当前节点的日志条目
+	currentTerm int //当前节点见过的最新任期
+	votedFor    int //当前节点投票给谁了
+	log         Log //当前节点的日志条目
 
 	//Volatile state on all servers:
 	commitIndex int // 当前节点日志中已经提交的最新索引
@@ -87,6 +83,45 @@ type Raft struct {
 	//Volatile state on leaders:
 	nextIndex  []int // 对于每个服务器 要接收的日志索引
 	matchIndex []int // 对于每个服务器 已知的被复制的日志的索引
+
+	snapshot          []byte
+	lastsnapshotTerm  int
+	lastsnapshotIndex int
+	trysnapshot       bool
+}
+
+func Make(peers []*labrpc.ClientEnd, me int,
+	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rf := &Raft{}
+	rf.peers = peers
+	rf.persister = persister
+	rf.me = me
+
+	// Your initialization code here (2A, 2B, 2C).
+
+	//2A
+	rf.state = Follower     // 节点初始角色
+	rf.commitIndex = 0      // 当前节点见过的最新任期 初始化为0
+	rf.votedFor = -1        // 当前节点投票给谁了 初始化为-1
+	rf.resetElectionTimer() // 重置当前节点的过期时间
+
+	rf.log = makeEmptyLog() // 创建日志
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
+	// start ticker goroutine to start elections
+	go rf.ticker()
+
+	return rf
+}
+
+// 如果接收到的 RPC 请求或响应中，任期号T > currentTerm
+// 则令 currentTerm = T，并切换为跟随者状态
+func (rf *Raft) setNewTerm(term int) {
+	rf.state = Follower
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.persist()
 }
 
 // return currentTerm and whether this server
@@ -151,61 +186,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	term         int //候选者的任期
-	candidateId  int // 候选者的索引
-	lastLogIndex int // 候选者的最后一条日志的索引
-	lastLogTerm  int // 候选者的最后一条日志的任期
-}
-
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-type RequestVoteReply struct {
-	// Your data here (2A).
-	term        int //回应给候选者的当前节点的任期
-	voteGranted int // 是否投票
-}
-
-// example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-}
-
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -255,45 +235,15 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		time.Sleep(rf.heartbeat)
+		time.Sleep(time.Duration(101) * time.Millisecond)
 		rf.mu.Lock()
-		defer rf.mu.Unlock()
 		if rf.state == Leader {
-			rf.AppendEntries()
+			rf.sendAppendsL(true) // 如果自己是领导者 发送心跳包
+		} else { // 如果不是领导者
+			if time.Now().After(rf.electionTime) {
+				rf.startElectionL() //当前节点到达超时选举时间 开始一轮选举
+			}
 		}
+		rf.mu.Unlock()
 	}
-}
-
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-
-	//2A
-	rf.Follower = Follower               // 节点初始角色
-	rf.commitIndex = 0                   //当前节点见过的最新任期 初始化为0
-	rf.votedFor = -1                     //当前节点投票给谁了 初始化为-1
-	rf.heartBeat = 50 * time.Millisecond // 心跳间隔
-	rf.resetElection()                   // 重置当前节点的过期时间
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
-	// start ticker goroutine to start elections
-	go rf.ticker()
-
-	return rf
 }
